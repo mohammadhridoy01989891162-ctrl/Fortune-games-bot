@@ -1,0 +1,262 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+
+// Fortune Gems Signal Bot – client-side, educational analyzer // Works with manual inputs (recent round outcomes) and produces heuristic "signals" // NOTE: This does NOT hack or predict server RNG. It analyzes user-entered history // and generates disciplined entries + bankroll guidance for practice/testing.
+
+// ---- Helper utils ---- const formatTime = (d = new Date()) => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+// z-score utility const zScore = (value, mean, std) => (std > 1e-9 ? (value - mean) / std : 0);
+
+// Simple rolling stats function rollingStats(arr, window) { const out = []; let sum = 0; for (let i = 0; i < arr.length; i++) { sum += arr[i]; if (i >= window) sum -= arr[i - window]; const count = Math.min(i + 1, window); const mean = sum / count; // std let sq = 0; for (let j = i - count + 1; j <= i; j++) sq += Math.pow(arr[j], 2); const std = Math.sqrt(sq / count - mean * mean); out.push({ mean, std, count }); } return out; }
+
+// Convert bucketed text (e.g., L,M,H or numbers) to numeric scale 0..100 function normalizeEntry(raw, bucketMap) { if (raw == null) return null; if (typeof raw === "number" && !Number.isNaN(raw)) return clamp(raw, 0, 100); const s = String(raw).trim().toUpperCase(); if (s in bucketMap) return bucketMap[s]; const n = Number(s); if (!Number.isNaN(n)) return clamp(n, 0, 100); return null; }
+
+function useLocalStorage(key, initial) { const [v, setV] = useState(() => { try { const got = localStorage.getItem(key); return got ? JSON.parse(got) : initial; } catch { return initial; } }); useEffect(() => { try { localStorage.setItem(key, JSON.stringify(v)); } catch {} }, [key, v]); return [v, setV]; }
+
+const beepData = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABYAAAACABAAAAAA//8AAP//AAD//wAA"; // short click
+
+export default function FortuneGemsBot() { // Buckets: L=low, M=mid, H=high outcome strength 0..100 const [bucketMap, setBucketMap] = useLocalStorage("fg-buckets", { L: 20, M: 50, H: 85, });
+
+const [history, setHistory] = useLocalStorage("fg-history", []); // numbers 0..100 (latest at end) const [input, setInput] = useState(""); const [autoMode, setAutoMode] = useLocalStorage("fg-auto", false); const [risk, setRisk] = useLocalStorage("fg-risk", 2); // % per trade const [bankroll, setBankroll] = useLocalStorage("fg-bankroll", 1000); const [sound, setSound] = useLocalStorage("fg-sound", true); const [log, setLog] = useLocalStorage("fg-log", []); const audioRef = useRef(null);
+
+// Derived stats const last50 = useMemo(() => history.slice(-50), [history]); const w = 12; const stats = useMemo(() => rollingStats(last50, Math.min(w, Math.max(3, last50.length))), [last50]); const latest = last50[last50.length - 1] ?? null; const mean = stats[stats.length - 1]?.mean ?? null; const std = stats[stats.length - 1]?.std ?? null;
+
+// Streaks & momentum const streak = useMemo(() => { if (last50.length === 0) return { dir: 0, len: 0 }; let len = 1; let dir = 0; // -1 down, +1 up for (let i = last50.length - 1; i > 0; i--) { const d = Math.sign(last50[i] - last50[i - 1]); if (dir === 0) dir = d; if (d === dir && d !== 0) len++; else break; } return { dir, len }; }, [last50]);
+
+// Volatility regime 0..1 const vol = useMemo(() => clamp((std ?? 0) / 25, 0, 1), [std]);
+
+// Core heuristic signal const signal = useMemo(() => { if (last50.length < 8 || mean == null || std == null) return null; const z = zScore(latest, mean, Math.max(std, 1));
+
+// Momentum bias
+const momentum = streak.dir * Math.min(1, streak.len / 4);
+
+// Regime adjustment: in high vol, fade extremes; in low vol, follow trend
+const followBias = vol < 0.35 ? 0.6 : 0.25;
+const fadeBias = vol > 0.55 ? 0.55 : 0.2;
+
+// Score: combine momentum (trend) and mean-reversion (z)
+const score = followBias * momentum - fadeBias * clamp(z, -2, 2) / 2;
+
+// Map score -> action
+let action = "HOLD";
+let confidence = 50 + Math.abs(score) * 40; // 50..90
+if (score > 0.25) action = "BET HIGH";
+else if (score < -0.25) action = "BET LOW";
+
+// Position sizing via Kelly fraction lite based on confidence and vol
+const edge = (confidence - 50) / 100; // -0.5..0.4
+const kelly = clamp(edge / Math.max(1, vol * 2.5), -0.05, 0.08); // -5%..8%
+const suggestedPct = clamp(Math.abs(kelly) * 100, 0.2, risk);
+const stop = Math.max(1, bankroll * 0.05); // session stop 5%
+
+return {
+  action,
+  confidence: Math.round(confidence),
+  suggestedPct: Number(suggestedPct.toFixed(2)),
+  stopLossSession: Number(stop.toFixed(2)),
+  context: { z: Number(z.toFixed(2)), vol: Number(vol.toFixed(2)), momentum: Number(momentum.toFixed(2)) },
+};
+
+}, [last50, mean, std, streak, vol, risk, bankroll]);
+
+// Auto mode: synthesize a pseudo feed from last value to demo behavior useEffect(() => { if (!autoMode) return; const id = setInterval(() => { const base = history[history.length - 1] ?? 50; // pseudo random walk with regime shifts const drift = (Math.random() - 0.5) * (20 + vol * 40); const next = clamp(base + drift, 0, 100); setHistory((h) => [...h.slice(-199), next]); }, 1500); return () => clearInterval(id); }, [autoMode, history, setHistory, vol]);
+
+// Play sound on new actionable signal const prevActionRef = useRef(null); useEffect(() => { if (!signal) return; if (prevActionRef.current !== signal.action) { prevActionRef.current = signal.action; if (sound && audioRef.current) { audioRef.current.currentTime = 0; audioRef.current.play().catch(() => {}); } setLog((L) => [ { t: Date.now(), action: signal.action, confidence: signal.confidence, pct: signal.suggestedPct, ctx: signal.context, mean: Number((mean ?? 0).toFixed(2)), last: Number((latest ?? 0).toFixed(2)), }, ...L, ].slice(0, 200)); } }, [signal, sound, setLog, mean, latest]);
+
+function addEntriesFromText() { const parts = input.split(/[,\n\s]+/).filter(Boolean); const mapped = parts .map((p) => normalizeEntry(p, bucketMap)) .filter((v) => v != null); if (mapped.length) setHistory((h) => [...h.slice(-200 + mapped.length), ...mapped]); setInput(""); }
+
+function addQuick(bucket) { const v = bucketMap[bucket]; if (v != null) setHistory((h) => [...h.slice(-199), v]); }
+
+function resetAll() { if (!confirm("Clear history and logs?")) return; setHistory([]); setLog([]); }
+
+const tip = useMemo(() => { if (!signal) return "Feed at least 8 rounds to start receiving signals."; if (signal.action === "HOLD") return "Market uncertain: reduce size or wait for clearer edge."; if (signal.action.includes("HIGH")) return "Bullish bias detected: trend-follow favored in calm regimes."; return "Bearish bias detected: mean-reversion opportunity in high volatility."; }, [signal]);
+
+return ( <div className="min-h-screen w-full bg-neutral-950 text-neutral-100 p-4 sm:p-6"> <audio ref={audioRef} src={beepData} preload="auto" /> <div className="max-w-6xl mx-auto grid gap-4"> <header className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3"> <div> <h1 className="text-2xl sm:text-3xl font-bold tracking-tight">Fortune Gems Signal Bot</h1> <p className="text-sm text-neutral-400 mt-1">Client-side analyzer for practice. Enter recent outcomes as L/M/H or 0–100. No hacks, no guarantees.</p> </div> <div className="flex flex-wrap items-center gap-2"> <button onClick={() => setAutoMode((v) => !v)} className={px-3 py-2 rounded-2xl text-sm shadow ${autoMode ? "bg-emerald-600" : "bg-neutral-800"}}>{autoMode ? "Auto: ON" : "Auto: OFF"}</button> <button onClick={resetAll} className="px-3 py-2 rounded-2xl text-sm shadow bg-neutral-800">Reset</button> </div> </header>
+
+{/* Controls */}
+    <section className="grid md:grid-cols-3 gap-4">
+      <div className="md:col-span-2 bg-neutral-900/60 border border-neutral-800 rounded-2xl p-4 shadow">
+        <h2 className="font-semibold mb-2">Add Outcomes</h2>
+        <div className="flex flex-wrap gap-2 mb-3">
+          {(["L","M","H"]).map((b) => (
+            <button key={b} onClick={() => addQuick(b)} className="px-3 py-2 rounded-2xl bg-neutral-800 text-sm shadow">{b}</button>
+          ))}
+        </div>
+        <textarea
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          placeholder="Paste values like: L M H 35 60 80 L H...\n(Separated by space/comma/newline)"
+          className="w-full h-28 rounded-xl bg-neutral-800/70 border border-neutral-700 p-3 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-600"
+        />
+        <div className="mt-2 flex gap-2">
+          <button onClick={addEntriesFromText} className="px-3 py-2 rounded-2xl bg-emerald-600 text-sm font-medium shadow">Add</button>
+          <button onClick={() => setHistory((h) => h.slice(0, -1))} className="px-3 py-2 rounded-2xl bg-neutral-800 text-sm shadow">Undo</button>
+        </div>
+      </div>
+
+      <div className="bg-neutral-900/60 border border-neutral-800 rounded-2xl p-4 shadow">
+        <h2 className="font-semibold mb-2">Settings</h2>
+        <label className="block text-sm text-neutral-400 mb-1">Bucket map (L/M/H → 0–100)</label>
+        <div className="grid grid-cols-3 gap-2 mb-3">
+          {["L","M","H"].map((k) => (
+            <div key={k} className="bg-neutral-800 rounded-xl p-2">
+              <div className="text-xs mb-1">{k}</div>
+              <input type="number" className="w-full bg-neutral-900 rounded-lg p-2 text-sm"
+                value={bucketMap[k]}
+                onChange={(e) => setBucketMap({ ...bucketMap, [k]: clamp(Number(e.target.value||0),0,100) })}
+              />
+            </div>
+          ))}
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="block text-sm text-neutral-400 mb-1">Bankroll</label>
+            <input type="number" value={bankroll} onChange={(e)=> setBankroll(Math.max(0, Number(e.target.value||0)))} className="w-full bg-neutral-800 rounded-xl p-2" />
+          </div>
+          <div>
+            <label className="block text-sm text-neutral-400 mb-1">Max % per bet</label>
+            <input type="number" value={risk} onChange={(e)=> setRisk(clamp(Number(e.target.value||0), 0.2, 10))} className="w-full bg-neutral-800 rounded-xl p-2" />
+          </div>
+        </div>
+        <div className="mt-3 flex items-center gap-2">
+          <input id="sound" type="checkbox" checked={sound} onChange={(e)=> setSound(e.target.checked)} />
+          <label htmlFor="sound" className="text-sm">Sound alerts</label>
+        </div>
+      </div>
+    </section>
+
+    {/* Signal Card */}
+    <section className="bg-neutral-900/60 border border-neutral-800 rounded-2xl p-4 shadow">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+        <div>
+          <div className="text-xs uppercase tracking-wide text-neutral-400">Live Signal</div>
+          <div className="text-lg sm:text-xl font-bold">{signal ? signal.action : "Waiting for data..."}</div>
+        </div>
+        <div className="flex gap-3 text-sm">
+          <div className="bg-neutral-800 rounded-xl p-2">
+            <div className="text-neutral-400 text-xs">Confidence</div>
+            <div className="font-semibold">{signal ? signal.confidence + "%" : "—"}</div>
+          </div>
+          <div className="bg-neutral-800 rounded-xl p-2">
+            <div className="text-neutral-400 text-xs">Suggest Size</div>
+            <div className="font-semibold">{signal ? signal.suggestedPct + "%" : "—"}</div>
+          </div>
+          <div className="bg-neutral-800 rounded-xl p-2">
+            <div className="text-neutral-400 text-xs">Session Stop</div>
+            <div className="font-semibold">{signal ? signal.stopLossSession : "—"}</div>
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-3 text-sm text-neutral-300">{tip}</div>
+      <div className="mt-3 grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs text-neutral-400">
+        <div className="bg-neutral-800 rounded-xl p-2">Last: <span className="text-neutral-200">{latest ?? "—"}</span></div>
+        <div className="bg-neutral-800 rounded-xl p-2">Mean: <span className="text-neutral-200">{mean?.toFixed(2) ?? "—"}</span></div>
+        <div className="bg-neutral-800 rounded-xl p-2">Vol: <span className="text-neutral-200">{vol?.toFixed(2) ?? "—"}</span></div>
+        <div className="bg-neutral-800 rounded-xl p-2">Z: <span className="text-neutral-200">{signal?.context.z ?? "—"}</span></div>
+      </div>
+    </section>
+
+    {/* Charts (minimal) */}
+    <section className="grid md:grid-cols-3 gap-4">
+      <div className="md:col-span-2 bg-neutral-900/60 border border-neutral-800 rounded-2xl p-4">
+        <h3 className="font-semibold mb-2">Recent History (last {last50.length})</h3>
+        <Sparkline data={last50} />
+      </div>
+      <div className="bg-neutral-900/60 border border-neutral-800 rounded-2xl p-4">
+        <h3 className="font-semibold mb-2">How to Use</h3>
+        <ul className="text-sm list-disc pl-5 space-y-2 text-neutral-300">
+          <li>Feed your last 20–50 round outcomes as L/M/H or 0–100 strength.</li>
+          <li>Wait for a clear signal (&gt; 60% confidence) before acting.</li>
+          <li>Respect the suggested size cap and the session stop.</li>
+          <li>For education/testing only. Outcomes are independent; no guaranteed edge.</li>
+        </ul>
+      </div>
+    </section>
+
+    {/* Log */}
+    <section className="bg-neutral-900/60 border border-neutral-800 rounded-2xl p-4">
+      <div className="flex items-center justify-between">
+        <h3 className="font-semibold">Signal Log</h3>
+        <div className="text-xs text-neutral-400">{formatTime()}</div>
+      </div>
+      <div className="mt-2 max-h-64 overflow-auto rounded-xl border border-neutral-800">
+        <table className="w-full text-sm">
+          <thead className="bg-neutral-900/80 sticky top-0">
+            <tr>
+              <th className="text-left p-2">Time</th>
+              <th className="text-left p-2">Action</th>
+              <th className="text-left p-2">Conf</th>
+              <th className="text-left p-2">Size %</th>
+              <th className="text-left p-2">Z</th>
+              <th className="text-left p-2">Vol</th>
+              <th className="text-left p-2">Mean</th>
+              <th className="text-left p-2">Last</th>
+            </tr>
+          </thead>
+          <tbody>
+            {log.map((row, i) => (
+              <tr key={i} className="odd:bg-neutral-900/40">
+                <td className="p-2 text-neutral-400">{new Date(row.t).toLocaleTimeString()}</td>
+                <td className="p-2 font-semibold">{row.action}</td>
+                <td className="p-2">{row.confidence}%</td>
+                <td className="p-2">{row.pct}%</td>
+                <td className="p-2">{row.ctx.z}</td>
+                <td className="p-2">{row.ctx.vol}</td>
+                <td className="p-2">{row.mean}</td>
+                <td className="p-2">{row.last}</td>
+              </tr>
+            ))}
+            {!log.length && (
+              <tr>
+                <td className="p-3 text-neutral-400" colSpan={8}>No logs yet.</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <footer className="text-center text-xs text-neutral-500 mt-2">
+      Built for learning & discipline. Follow game Terms of Service. No affiliation.
+    </footer>
+  </div>
+</div>
+
+); }
+
+function Sparkline({ data = [] }) { const ref = useRef(null); useEffect(() => { const canvas = ref.current; if (!canvas) return; const ctx = canvas.getContext("2d"); const w = canvas.width = canvas.clientWidth * devicePixelRatio; const h = canvas.height = 140 * devicePixelRatio; ctx.clearRect(0,0,w,h); if (!data.length) return; const min = Math.min(...data); const max = Math.max(...data); const pad = 8 * devicePixelRatio; const nx = (i) => pad + (w - pad * 2) * (i / Math.max(1, data.length - 1)); const ny = (v) => h - pad - (h - pad * 2) * ((v - min) / Math.max(1e-6, max - min));
+
+// grid
+ctx.globalAlpha = 0.25;
+ctx.strokeStyle = "#555";
+[0.25, 0.5, 0.75].forEach((p) => {
+  const y = pad + (h - pad * 2) * p;
+  ctx.beginPath();
+  ctx.moveTo(pad, y);
+  ctx.lineTo(w - pad, y);
+  ctx.stroke();
+});
+ctx.globalAlpha = 1;
+
+// line
+ctx.lineWidth = 2 * devicePixelRatio;
+ctx.strokeStyle = "#22c55e"; // emerald
+ctx.beginPath();
+ctx.moveTo(nx(0), ny(data[0]));
+for (let i = 1; i < data.length; i++) ctx.lineTo(nx(i), ny(data[i]));
+ctx.stroke();
+
+// last point
+const lx = nx(data.length - 1);
+const ly = ny(data[data.length - 1]);
+ctx.fillStyle = "#e5e7eb";
+ctx.beginPath();
+ctx.arc(lx, ly, 3 * devicePixelRatio, 0, Math.PI * 2);
+ctx.fill();
+
+}, [data]);
+
+return <canvas ref={ref} className="w-full h-[140px]" />; }
+
